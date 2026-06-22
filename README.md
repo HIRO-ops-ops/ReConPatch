@@ -1,21 +1,22 @@
-# ReConPatch with U-Net Feature Extractor (Industrial Anomaly Detection)
+# ReConPatch with Pre-trained ResNet50 Feature Extractor (Industrial Anomaly Detection)
 
-本プロジェクトは、論文 **"ReConPatch: Contrastive Patch Representation Learning for Industrial Anomaly Detection"** [1] の手法に基づき、U-Netのエンコーダからマルチスケールなパッチ特徴量を抽出し、対照学習（Metric Learning）を適用して製品の異常検知および異常個所のセグメンテーション（可視化）を行うシステムの実装である。
-
----
-
-## 主な特徴
-
-1. **U-Net型マルチスケール特徴抽出:** U-Netのダウンサンプリング層（低レベル・中レベル・高レベルの異なる解像度の特徴マップ）から豊富な表現を抽出し、チャンネル方向に結合してパッチ特徴量として集約する [2, 5]。
-2. **Keras 3 & TensorFlow 2.16+ 完全互換:** オプティマイザの勾配計算と更新処理に標準的な `apply_gradients` 方式を採用し、新しいTensorFlow/Keras環境でも安定して動作する。
-3. **MVTec AD対応の再帰的画像探索:** テスト用フォルダ（`test/`）配下のサブフォルダ（`broken_large` や `contamination` など）の階層構造を再帰的に探索し、一括で読み込む。
-4. **出力画像の上書き防止設計:** テスト画像の相対パス情報からユニークなファイル名（例: `anomaly_broken_large_000.png`）を自動生成し、異なるカテゴリ間で同名ファイルが上書きされるのを防ぐ。
-5. **高速コアセット抽出:** 論文で採用されている **Greedy K-Center法** に基づき、大量の正常パッチから代表点をサンプリングして効率的なメモリバンクを構築 [4]。
-6. **異常セグメンテーション（ヒートマップ表示）:** テスト画像の各ピクセル（パッチ）に対して異常スコアを計算し、オリジナル画像にヒートマップ（ジェットカラー）として重ね合わせた比較画像を出力する [4, 8]。
+本プロジェクトは、論文 **"ReConPatch: Contrastive Patch Representation Learning for Industrial Anomaly Detection"** [1] の手法に基づき、事前学習済みの堅牢な特徴抽出器からマルチスケールなパッチ特徴量を抽出し、対照学習（Metric Learning）を適用して製品の異常検知および異常個所のセグメンテーション（可視化）を行うシステムの実装である。
 
 ---
 
-## フォルダ構成（MVTec ADデータセットの例）
+## 📌 主な特徴
+
+1. **事前学習済みResNet50バックボーン:** ランダム初期化されたネットワークに代わり、ImageNet事前学習済みの `ResNet50` から多重解像度（低レベル・中レベル・高レベルの混在）の特徴を抽出。これにより、微細な欠陥からマクロな変形までを的確に捉え、圧倒的な**汎化性能（未知の異常への対応力）**を実現します [2, 5]。
+2. **ガウシアン平滑化（ガウスぼかし）によるノイズ抑制:** 予測したアノマリーマップに対して SciPy のガウスフィルター（`gaussian_filter`）を適用。ピクセルレベルでの局所的なノイズ（偽陽性）を滑らかにカットし、境界線を明瞭に表現します。
+3. **詳細な進捗表示（経過の見え化）:** CPU等の処理環境でもフリーズしていないことが一目でわかるよう、対照学習トレーニング（バッチ進行状況およびLossの更新）、コアセット抽出（%進行度）、テスト推論時（処理中ファイル数 `/` 総ファイル数）の詳細な進捗ログを表示します。
+4. **Keras 3 & TensorFlow 2.16+ 完全互換:** オプティマイザの勾配計算と更新処理に標準的な `apply_gradients` 方式を採用し、最新のTensorFlow/Keras環境でも安定して動作します。
+5. **MVTec AD対応の再帰的画像探索:** テスト用フォルダ（`test/`）配下のサブフォルダ（`broken_large` や `contamination` など）の階層構造を再帰的に探索し、一括で読み込みます。
+6. **出力画像の上書き防止設計:** テスト画像の相対パス情報からユニークなファイル名（例: `anomaly_broken_large_000.png`）を自動生成し、異なるカテゴリ間で同名ファイルが上書きされるのを防ぎます。
+7. **高速コアセット抽出:** 論文で採用されている **Greedy K-Center法** に基づき、大量の正常パッチから代表点をサンプリングして効率的なメモリバンクを構築します [4]。
+
+---
+
+## 📁 フォルダ構成（MVTec ADデータセットの例）
 
 本プログラムを実行する前に、以下のように画像データが配置されていることをご確認（ここでは `bottle` データセットを例としている）。
 
@@ -59,7 +60,9 @@ INPUT_TRAIN_DIR = "/home/medicot/ReconPatch/bottle/train/good"
 INPUT_TEST_DIR = "/home/medicot/ReconPatch/bottle/test"
 OUTPUT_DIR = "/home/medicot/ReconPatch/bottle/output_results"
 2. **スクリプトの実行:**準備ができたら、仮想環境が有効な状態で以下のコマンドを実行し、スクリプトを走らせる。
+```bash
 python ReconPatch.py
+```
 3. **結果の確認：** プログラムの実行が完了すると、OUTPUT_DIR（例: bottle/output_results/）フォルダ内に、オリジナル画像と異常箇所をヒートマップで可視化した比較画像が自動的に保存される。保存ファイル名は、同名ファイルによる上書きを防ぐためにサブフォルダ名が統合されます（例: anomaly_broken_large_000.png）。
 
 ---
