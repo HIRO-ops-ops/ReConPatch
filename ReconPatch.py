@@ -1,60 +1,45 @@
 # type: ignore
 import os
 import glob
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow.keras as keras
 from tensorflow.keras import layers
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from scipy.ndimage import gaussian_filter
 from PIL import Image
 
 # ==========================================
-# 1. U-Netエンコーダによるマルチスケール特徴抽出
+# 1. 事前学習済みバックボーンによる特徴抽出
 # ==========================================
 
-def build_unet_encoder(input_shape=(224, 224, 3)):
+def build_resnet_encoder(input_shape=(224, 224, 3)):
     """
-    U-Netのエンコーダ（ダウンサンプリング層）を定義。
-    低レベル・中レベル・高レベルのマルチスケール特徴マップを出力します。
+    ImageNet事前学習済みResNet50を特徴抽出器として採用 [2]。
     """
-    inputs = layers.Input(shape=input_shape)
+    base_model = keras.applications.ResNet50(weights='imagenet', include_top=False, input_shape=input_shape)
+    base_model.trainable = False
     
-    # Block 1 (224x224)
-    c1 = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(inputs)
-    c1 = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(c1)
-    p1 = layers.MaxPooling2D((2, 2))(c1) # 112x112
+    out1 = base_model.get_layer("conv3_block4_out").output  # 28x28x512
+    out2 = base_model.get_layer("conv4_block6_out").output  # 14x14x1024
     
-    # Block 2 (112x112)
-    c2 = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(p1)
-    c2 = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(c2)
-    p2 = layers.MaxPooling2D((2, 2))(c2) # 56x56
-    
-    # Block 3 (56x56)
-    c3 = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(p2)
-    c3 = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(c3)
-    p3 = layers.MaxPooling2D((2, 2))(c3) # 28x28
-    
-    # 浅いレイヤー(c1), 中間(c2), 深いレイヤー(c3)の特徴を出力
-    # ※実運用では学習済み重み（Segmentation Models等）をロードすることを推奨します
-    model = keras.Model(inputs=inputs, outputs=[c1, c2, c3], name="UNet_Encoder")
+    model = keras.Model(inputs=base_model.input, outputs=[out1, out2], name="ResNet50_Encoder")
     return model
 
 
-def aggregate_features(feature_maps, target_size=(56, 56), patch_size=3):
+def aggregate_features(feature_maps, target_size=(28, 28), patch_size=3):
     """
-    論文3.1節に基づき、複数スケールの特徴マップを同じ解像度にリサイズ・結合し、
-    指定パッチサイズで近傍平均プーリング（空間的な集約）を行います [2]。
+    複数スケールの特徴マップを同じ解像度にリサイズ・結合し、空間集約を行います [2]。
     """
     resized_maps = []
     for f_map in feature_maps:
-        # すべての特徴マップを指定サイズ（例: 56x56）にリサイズ
         resized = tf.image.resize(f_map, target_size, method='bilinear')
         resized_maps.append(resized)
     
-    # チャンネル方向に結合
-    concat_features = tf.concat(resized_maps, axis=-1) # (B, H, W, Total_C)
+    concat_features = tf.concat(resized_maps, axis=-1)
     
-    # 近傍平均プーリングによる局所的な特徴の平滑化
     aggregated = tf.nn.avg_pool2d(
         concat_features, 
         ksize=patch_size, 
@@ -65,7 +50,7 @@ def aggregate_features(feature_maps, target_size=(56, 56), patch_size=3):
 
 
 # ==========================================
-# 2. 前ターンで作成した ReConPatch 構成要素
+# 2. ReConPatch 構成要素
 # ==========================================
 
 def l2_distance(z):
@@ -135,32 +120,27 @@ class ReConPatchModel(keras.Model):
         return self.embedding(x)
 
     def train_step(self, x):
-            h_ema = self.ema_embedding(x)
-            z_ema = self.ema_projection(h_ema)
-            p_sim = self.pairwise_similarity(z_ema)
-            c_sim = self.contextual_similarity(z_ema)
-            w = self.alpha * p_sim + (1 - self.alpha) * c_sim
+        h_ema = self.ema_embedding(x)
+        z_ema = self.ema_projection(h_ema)
+        p_sim = self.pairwise_similarity(z_ema)
+        c_sim = self.contextual_similarity(z_ema)
+        w = self.alpha * p_sim + (1 - self.alpha) * c_sim
 
-            with tf.GradientTape() as tape:
-                h = self.embedding(x)
-                z = self.projection(h)
-                distances = tf.sqrt(l2_distance(z) + 1e-9)
-                delta = distances / tf.reduce_mean(distances, axis=-1, keepdims=True)
-                rc_loss = tf.reduce_sum(tf.reduce_mean(
-                    w * (delta ** 2) + (1 - w) * (tf.nn.relu(self.margin - delta) ** 2),
-                    axis=-1
-                ))
+        with tf.GradientTape() as tape:
+            h = self.embedding(x)
+            z = self.projection(h)
+            distances = tf.sqrt(l2_distance(z) + 1e-9)
+            delta = distances / tf.reduce_mean(distances, axis=-1, keepdims=True)
+            rc_loss = tf.reduce_sum(tf.reduce_mean(
+                w * (delta ** 2) + (1 - w) * (tf.nn.relu(self.margin - delta) ** 2),
+                axis=-1
+            ))
 
-            # ==================== 修正部分 ====================
-            # 1. 損失に対するモデルの重み（trainable_variables）の勾配を計算します
-            gradients = tape.gradient(rc_loss, self.trainable_variables)
-            
-            # 2. 勾配をオプティマイザに適用して、重みを更新します (Keras全バージョン互換)
-            self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-            # ==================================================
+        gradients = tape.gradient(rc_loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
 
-            self.update_ema()
-            return {"rc_loss": rc_loss}
+        self.update_ema()
+        return {"rc_loss": rc_loss}
 
     def update_ema(self):
         train_vars = self.embedding.variables + self.projection.variables
@@ -170,15 +150,28 @@ class ReConPatchModel(keras.Model):
 
 
 def greedy_k_center(features, coreset_ratio=0.01):
+    """
+    💡 進捗表示を追加したコアセットサンプリング [4]
+    """
     n = features.shape[0]
     num_centers = max(1, int(n * coreset_ratio))
     centers = [np.random.randint(n)]
+    
+    # 進捗表示の間隔（10%刻み）
+    log_interval = max(1, num_centers // 10)
+    
     min_dists = np.sum((features - features[centers[0]])**2, axis=1)
-    for _ in range(1, num_centers):
+    for i in range(1, num_centers):
         new_center = np.argmax(min_dists)
         centers.append(new_center)
         new_dists = np.sum((features - features[new_center])**2, axis=1)
         min_dists = np.minimum(min_dists, new_dists)
+        
+        # コアセット選択の進捗を出力
+        if i % log_interval == 0 or i == num_centers - 1:
+            progress_pct = (i + 1) / num_centers * 100
+            print(f"  [コアセット選択進捗] {i+1} / {num_centers} 点選択完了 ({progress_pct:.1f}%)")
+            
     return features[centers]
 
 
@@ -210,14 +203,14 @@ class ReConPatchSpatialDetector:
         self.memory_bank = None
 
     def fit(self, spatial_features, epochs=10, batch_size=64, learning_rate=1e-4):
-        """
-        spatial_features: (B, H, W, C) のテンソルを受け取ってパッチ単位で学習
-        """
         B, H, W, C = spatial_features.shape
-        # (B * H * W, C) にフラット化して対照学習を行う
         flat_features = tf.reshape(spatial_features, (-1, C))
+        total_patches = flat_features.shape[0]
         
-        print(f"--- 訓練開始 (総パッチ数: {flat_features.shape[0]}) ---")
+        # 1エポックあたりのバッチ数を計算
+        num_batches = math.ceil(total_patches / batch_size)
+        
+        print(f"--- 訓練開始 (総パッチ数: {total_patches}, 総バッチ数/エポック: {num_batches}) ---")
         dataset = tf.data.Dataset.from_tensor_slices(flat_features).shuffle(2000).batch(batch_size)
         optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
         self.model.compile(optimizer=optimizer)
@@ -228,153 +221,141 @@ class ReConPatchSpatialDetector:
                 metrics = self.model.train_step(batch)
                 epoch_loss += metrics["rc_loss"].numpy()
                 steps += 1
-            print(f"Epoch {epoch+1}/{epochs} - Loss: {epoch_loss / steps:.4f}")
+                
+                # 💡 500バッチごと、またはエポックの最終バッチ時に経過を出力
+                if steps % 500 == 0 or steps == num_batches:
+                    current_loss = metrics["rc_loss"].numpy()
+                    print(f"  [Epoch {epoch+1}/{epochs}] バッチ: {steps}/{num_batches} - 現在のバッチLoss: {current_loss:.4f}")
+                    
+            print(f"=> Epoch {epoch+1}/{epochs} 終了 - 平均Loss: {epoch_loss / steps:.4f}\n")
 
-        # コアセットメモリバンクの構築
+        print("特徴空間のマッピングおよびメモリバンク（コアセット）構築を開始します...")
         mapped_flat = self.model(flat_features).numpy()
-        print("メモリバンク（コアセット）構築中...")
         self.memory_bank = greedy_k_center(mapped_flat, coreset_ratio=self.coreset_ratio)
-        print(f"メモリバンク構築完了 (登録数: {self.memory_bank.shape[0]})")
+        print(f"メモリバンク構築完了 (登録代表点数: {self.memory_bank.shape[0]})")
 
     def predict_anomaly_map(self, test_spatial_features, spatial_shape):
-        """
-        2Dの各ピクセル（パッチ）に対して異常スコアを計算し、アノマリーマップを出力。
-        test_spatial_features: (1, H, W, C)
-        """
         H, W = spatial_shape
         flat_test = tf.reshape(test_spatial_features, (-1, test_spatial_features.shape[-1]))
         mapped_test = self.model(flat_test).numpy()
 
-        # 最も近いコアセット点までの距離を計算 (Eq. 9)
         dists = batch_euclidean_distance(mapped_test, self.memory_bank)
-        patch_scores = np.min(dists, axis=1) # (H * W,)
+        patch_scores = np.min(dists, axis=1)
 
-        # (H, W) のグリッド形状にリライト
         anomaly_map = patch_scores.reshape((H, W))
         return anomaly_map
 
 
 # ==========================================
-# 4. メインパイプライン（パス入出力とヒートマップ出力）
+# 4. 画像読み込みと前処理
 # ==========================================
 
-def load_and_preprocess_img(img_path, target_size=(224, 224)):
+def load_img_for_display(img_path, target_size=(224, 224)):
     img = Image.open(img_path).convert('RGB')
     img = img.resize(target_size)
-    x = np.array(img, dtype=np.float32) / 255.0
-    return x
+    return np.array(img, dtype=np.float32) / 255.0
 
+
+def preprocess_for_model(img_array):
+    return preprocess_input(img_array * 255.0)
+
+
+# ==========================================
+# 5. メインパイプライン
+# ==========================================
 
 def run_pipeline(input_train_dir, input_test_dir, output_dir, image_size=(224, 224)):
-    """
-    パスを指定してU-Net特徴抽出 -> ReConPatch学習 -> テスト推論 -> 結果画像保存
-    """
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. 画像のロード（サブディレクトリの再帰探索 [**] & 多様な拡張子に対応）
     extensions = ("**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.PNG", "**/*.JPG", "**/*.JPEG")
     
     train_paths = []
     for ext in extensions:
-        # recursive=True により、train_dir 配下のすべてのフォルダから画像を探索
         train_paths.extend(glob.glob(os.path.join(input_train_dir, ext), recursive=True))
         
     test_paths = []
     for ext in extensions:
-        # recursive=True により、test_dir/broken_large などの各サブフォルダから画像を探索
         test_paths.extend(glob.glob(os.path.join(input_test_dir, ext), recursive=True))
 
-    # パスの重複を排除してソート
     train_paths = sorted(list(set(train_paths)))
     test_paths = sorted(list(set(test_paths)))
 
     if not train_paths or not test_paths:
-        raise ValueError(
-            f"指定されたディレクトリに画像ファイルが見つかりません。\n"
-            f"探索されたパスを確認してください:\n"
-            f"  訓練フォルダ: {input_train_dir} (検出数: {len(train_paths)})\n"
-            f"  テストフォルダ: {input_test_dir} (検出数: {len(test_paths)})"
-        )
+        raise ValueError(f"画像ファイルが探索されませんでした。パスをご確認ください。")
 
     print(f"訓練用（正常）画像数: {len(train_paths)}")
     print(f"テスト用画像数: {len(test_paths)}")
 
-    train_images = np.array([load_and_preprocess_img(p, image_size) for p in train_paths])
+    train_images_display = np.array([load_img_for_display(p, image_size) for p in train_paths])
+    train_images_model = np.array([preprocess_for_model(img) for img in train_images_display])
 
-    # 2. U-Netエンコーダによる特徴抽出
-    unet_encoder = build_unet_encoder(input_shape=(image_size[0], image_size[1], 3))
+    resnet_encoder = build_resnet_encoder(input_shape=(image_size[0], image_size[1], 3))
     
-    # 訓練用データの特徴量をU-Netから得る
-    print("訓練データのU-Net特徴量を抽出中...")
-    raw_train_features = unet_encoder.predict(train_images, batch_size=4)
-    # パッチ特徴量への集約
-    spatial_train_features = aggregate_features(raw_train_features, target_size=(56, 56), patch_size=3)
+    print("訓練データのResNet50特徴量を抽出中...")
+    raw_train_features = resnet_encoder.predict(train_images_model, batch_size=4, verbose=1) # Keras内蔵進捗バーを表示
+    spatial_train_features = aggregate_features(raw_train_features, target_size=(28, 28), patch_size=3)
     
-    # 3. 検出器の初期化と訓練
     input_dim = spatial_train_features.shape[-1]
     detector = ReConPatchSpatialDetector(
         input_dim=input_dim,
         embedding_dim=256,
         projection_dim=64,
-        coreset_ratio=0.01  # メモリ容量1%に圧縮保存 [5]
+        coreset_ratio=0.01
     )
     detector.fit(spatial_train_features, epochs=5, batch_size=64)
 
-    # 4. テスト画像に対する推論とアノマリーマップの保存
+    # 💡 [進捗カウンタ] テスト画像推論の進行状況を見える化
+    total_test = len(test_paths)
     print("\n--- テスト画像の異常スコアマップの生成と保存 ---")
-    for test_path in test_paths:
-        orig_img = load_and_preprocess_img(test_path, image_size)
-        input_batch = np.expand_dims(orig_img, axis=0)
+    for idx, test_path in enumerate(test_paths):
+        display_img = load_img_for_display(test_path, image_size)
+        model_img = preprocess_for_model(display_img)
+        input_batch = np.expand_dims(model_img, axis=0)
         
-        # U-Netから特徴抽出と集約
-        raw_test_features = unet_encoder.predict(input_batch, verbose=0)
-        spatial_test_features = aggregate_features(raw_test_features, target_size=(56, 56), patch_size=3)
+        raw_test_features = resnet_encoder.predict(input_batch, verbose=0)
+        spatial_test_features = aggregate_features(raw_test_features, target_size=(28, 28), patch_size=3)
         
-        # アノマリーマップを予測
-        anomaly_map_small = detector.predict_anomaly_map(spatial_test_features, (56, 56))
+        anomaly_map_small = detector.predict_anomaly_map(spatial_test_features, (28, 28))
         
-        # 224x224 に拡大
         anomaly_map_resized = Image.fromarray(anomaly_map_small).resize(image_size, Image.Resampling.BILINEAR)
         anomaly_map_resized = np.array(anomaly_map_resized)
 
-        # Matplotlibを用いてオリジナル画像にヒートマップをオーバーレイ表示して保存 [8]
+        # ガウシアン平滑化
+        anomaly_map_smoothed = gaussian_filter(anomaly_map_resized, sigma=4)
+
+        # 可視化と保存
         fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-        axes[0].imshow(orig_img)
+        axes[0].imshow(display_img)
         axes[0].set_title("Original Image")
         axes[0].axis('off')
 
-        axes[1].imshow(orig_img)
-        axes[1].imshow(anomaly_map_resized, cmap='jet', alpha=0.5)
-        axes[1].set_title(f"Anomaly Heatmap (Max: {np.max(anomaly_map_resized):.2f})")
+        axes[1].imshow(display_img)
+        axes[1].imshow(anomaly_map_smoothed, cmap='jet', alpha=0.5)
+        axes[1].set_title(f"Anomaly Heatmap (Max: {np.max(anomaly_map_smoothed):.2f})")
         axes[1].axis('off')
 
-        # ⚠️ ファイル上書き対策: テストフォルダからの相対パスを取得してファイル名に使用します
-        # 例: test_path が ".../test/broken_large/000.png" の場合、
-        #     rel_path は "broken_large/000.png" となり、
-        #     保存名は "anomaly_broken_large_000.png" に変換されます。
         rel_path = os.path.relpath(test_path, input_test_dir)
         safe_file_name = "anomaly_" + rel_path.replace(os.sep, "_")
         output_file_path = os.path.join(output_dir, safe_file_name)
 
         plt.savefig(output_file_path, bbox_inches='tight')
         plt.close()
-        print(f"結果を保存しました: {output_file_path}")
+        
+        # 💡 [経過表示] 現在処理中の画像番号 / 全体数を表示
+        print(f"  [{idx+1: >3} / {total_test}] 結果を保存しました: {output_file_path}")
 
     print("\nすべての推論処理と結果の保存が完了しました。")
 
 
 # ==========================================
-# 5. メイン実行部
+# 6. メイン実行部
 # ==========================================
 
 if __name__ == "__main__":
-    # 実際のディレクトリパスを入力・出力に指定して実行します。
-    # ※ 事前にディレクトリが存在し、中に画像があるかご確認ください。
-    INPUT_TRAIN_DIR = "/home/medicot/ReconPatch/bottle/train/good"   # 正常画像フォルダ
-    INPUT_TEST_DIR = "/home/medicot/ReconPatch/bottle/test/good"            # テスト画像フォルダ
-    OUTPUT_DIR = "/home/medicot/ReconPatch/bottle/output_results"      # ヒートマップ結果保存先
+    INPUT_TRAIN_DIR = "/home/medicot/ReconPatch/bottle/train/good"
+    INPUT_TEST_DIR = "/home/medicot/ReconPatch/bottle/test"
+    OUTPUT_DIR = "/home/medicot/ReconPatch/bottle/output_results"
 
-    # 実行する際は、ダミーディレクトリでテストするか、実際のデータパスに書き換えてください。
     try:
         run_pipeline(
             input_train_dir=INPUT_TRAIN_DIR,
