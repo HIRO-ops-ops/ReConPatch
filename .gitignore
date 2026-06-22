@@ -1,5 +1,6 @@
 .venv/
 .bottle/
+output_results/
 dist/
 build/
 *.egg-info/

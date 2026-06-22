@@ -135,25 +135,32 @@ class ReConPatchModel(keras.Model):
         return self.embedding(x)
 
     def train_step(self, x):
-        h_ema = self.ema_embedding(x)
-        z_ema = self.ema_projection(h_ema)
-        p_sim = self.pairwise_similarity(z_ema)
-        c_sim = self.contextual_similarity(z_ema)
-        w = self.alpha * p_sim + (1 - self.alpha) * c_sim
+            h_ema = self.ema_embedding(x)
+            z_ema = self.ema_projection(h_ema)
+            p_sim = self.pairwise_similarity(z_ema)
+            c_sim = self.contextual_similarity(z_ema)
+            w = self.alpha * p_sim + (1 - self.alpha) * c_sim
 
-        with tf.GradientTape() as tape:
-            h = self.embedding(x)
-            z = self.projection(h)
-            distances = tf.sqrt(l2_distance(z) + 1e-9)
-            delta = distances / tf.reduce_mean(distances, axis=-1, keepdims=True)
-            rc_loss = tf.reduce_sum(tf.reduce_mean(
-                w * (delta ** 2) + (1 - w) * (tf.nn.relu(self.margin - delta) ** 2),
-                axis=-1
-            ))
+            with tf.GradientTape() as tape:
+                h = self.embedding(x)
+                z = self.projection(h)
+                distances = tf.sqrt(l2_distance(z) + 1e-9)
+                delta = distances / tf.reduce_mean(distances, axis=-1, keepdims=True)
+                rc_loss = tf.reduce_sum(tf.reduce_mean(
+                    w * (delta ** 2) + (1 - w) * (tf.nn.relu(self.margin - delta) ** 2),
+                    axis=-1
+                ))
 
-        self.optimizer.minimize(rc_loss, self.trainable_variables, tape=tape)
-        self.update_ema()
-        return {"rc_loss": rc_loss}
+            # ==================== 修正部分 ====================
+            # 1. 損失に対するモデルの重み（trainable_variables）の勾配を計算します
+            gradients = tape.gradient(rc_loss, self.trainable_variables)
+            
+            # 2. 勾配をオプティマイザに適用して、重みを更新します (Keras全バージョン互換)
+            self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+            # ==================================================
+
+            self.update_ema()
+            return {"rc_loss": rc_loss}
 
     def update_ema(self):
         train_vars = self.embedding.variables + self.projection.variables
@@ -264,12 +271,30 @@ def run_pipeline(input_train_dir, input_test_dir, output_dir, image_size=(224, 2
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. 画像のロード
-    train_paths = glob.glob(os.path.join(input_train_dir, "*.png")) + glob.glob(os.path.join(input_train_dir, "*.jpg"))
-    test_paths = glob.glob(os.path.join(input_test_dir, "*.png")) + glob.glob(os.path.join(input_test_dir, "*.jpg"))
+    # 1. 画像のロード（サブディレクトリの再帰探索 [**] & 多様な拡張子に対応）
+    extensions = ("**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.PNG", "**/*.JPG", "**/*.JPEG")
+    
+    train_paths = []
+    for ext in extensions:
+        # recursive=True により、train_dir 配下のすべてのフォルダから画像を探索
+        train_paths.extend(glob.glob(os.path.join(input_train_dir, ext), recursive=True))
+        
+    test_paths = []
+    for ext in extensions:
+        # recursive=True により、test_dir/broken_large などの各サブフォルダから画像を探索
+        test_paths.extend(glob.glob(os.path.join(input_test_dir, ext), recursive=True))
+
+    # パスの重複を排除してソート
+    train_paths = sorted(list(set(train_paths)))
+    test_paths = sorted(list(set(test_paths)))
 
     if not train_paths or not test_paths:
-        raise ValueError("指定されたディレクトリに画像ファイル（jpg/png）が見つかりません。")
+        raise ValueError(
+            f"指定されたディレクトリに画像ファイルが見つかりません。\n"
+            f"探索されたパスを確認してください:\n"
+            f"  訓練フォルダ: {input_train_dir} (検出数: {len(train_paths)})\n"
+            f"  テストフォルダ: {input_test_dir} (検出数: {len(test_paths)})"
+        )
 
     print(f"訓練用（正常）画像数: {len(train_paths)}")
     print(f"テスト用画像数: {len(test_paths)}")
@@ -282,7 +307,7 @@ def run_pipeline(input_train_dir, input_test_dir, output_dir, image_size=(224, 2
     # 訓練用データの特徴量をU-Netから得る
     print("訓練データのU-Net特徴量を抽出中...")
     raw_train_features = unet_encoder.predict(train_images, batch_size=4)
-    # パッチ特徴量への集約 (ターゲット解像度: 56x56, チャンネル合計数: 64+128+256=448)
+    # パッチ特徴量への集約
     spatial_train_features = aggregate_features(raw_train_features, target_size=(56, 56), patch_size=3)
     
     # 3. 検出器の初期化と訓練
@@ -291,7 +316,7 @@ def run_pipeline(input_train_dir, input_test_dir, output_dir, image_size=(224, 2
         input_dim=input_dim,
         embedding_dim=256,
         projection_dim=64,
-        coreset_ratio=0.01  # メモリ容量1%に圧縮保存
+        coreset_ratio=0.01  # メモリ容量1%に圧縮保存 [5]
     )
     detector.fit(spatial_train_features, epochs=5, batch_size=64)
 
@@ -299,17 +324,16 @@ def run_pipeline(input_train_dir, input_test_dir, output_dir, image_size=(224, 2
     print("\n--- テスト画像の異常スコアマップの生成と保存 ---")
     for test_path in test_paths:
         orig_img = load_and_preprocess_img(test_path, image_size)
-        # バッチ次元を追加
         input_batch = np.expand_dims(orig_img, axis=0)
         
         # U-Netから特徴抽出と集約
         raw_test_features = unet_encoder.predict(input_batch, verbose=0)
         spatial_test_features = aggregate_features(raw_test_features, target_size=(56, 56), patch_size=3)
         
-        # アノマリーマップ（異常確率マップ 56x56）を予測
+        # アノマリーマップを予測
         anomaly_map_small = detector.predict_anomaly_map(spatial_test_features, (56, 56))
         
-        # 可視化のために元の画像サイズ (224x224) にリプレイス
+        # 224x224 に拡大
         anomaly_map_resized = Image.fromarray(anomaly_map_small).resize(image_size, Image.Resampling.BILINEAR)
         anomaly_map_resized = np.array(anomaly_map_resized)
 
@@ -319,16 +343,19 @@ def run_pipeline(input_train_dir, input_test_dir, output_dir, image_size=(224, 2
         axes[0].set_title("Original Image")
         axes[0].axis('off')
 
-        # ヒートマップ表示
-        im = axes[1].imshow(orig_img)
-        # jetカラーマップで異常値をオーバーレイ
+        axes[1].imshow(orig_img)
         axes[1].imshow(anomaly_map_resized, cmap='jet', alpha=0.5)
         axes[1].set_title(f"Anomaly Heatmap (Max: {np.max(anomaly_map_resized):.2f})")
         axes[1].axis('off')
 
-        # ファイル名を作成して保存
-        base_name = os.path.basename(test_path)
-        output_file_path = os.path.join(output_dir, f"anomaly_{base_name}")
+        # ⚠️ ファイル上書き対策: テストフォルダからの相対パスを取得してファイル名に使用します
+        # 例: test_path が ".../test/broken_large/000.png" の場合、
+        #     rel_path は "broken_large/000.png" となり、
+        #     保存名は "anomaly_broken_large_000.png" に変換されます。
+        rel_path = os.path.relpath(test_path, input_test_dir)
+        safe_file_name = "anomaly_" + rel_path.replace(os.sep, "_")
+        output_file_path = os.path.join(output_dir, safe_file_name)
+
         plt.savefig(output_file_path, bbox_inches='tight')
         plt.close()
         print(f"結果を保存しました: {output_file_path}")
@@ -344,7 +371,7 @@ if __name__ == "__main__":
     # 実際のディレクトリパスを入力・出力に指定して実行します。
     # ※ 事前にディレクトリが存在し、中に画像があるかご確認ください。
     INPUT_TRAIN_DIR = "/home/medicot/ReconPatch/bottle/train/good"   # 正常画像フォルダ
-    INPUT_TEST_DIR = "/home/medicot/ReconPatch/bottle/test"            # テスト画像フォルダ
+    INPUT_TEST_DIR = "/home/medicot/ReconPatch/bottle/test/good"            # テスト画像フォルダ
     OUTPUT_DIR = "/home/medicot/ReconPatch/bottle/output_results"      # ヒートマップ結果保存先
 
     # 実行する際は、ダミーディレクトリでテストするか、実際のデータパスに書き換えてください。
